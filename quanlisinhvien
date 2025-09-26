@@ -1,0 +1,873 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;           // BindingList
+using System.Globalization;            // CharUnicodeInfo
+using System.Linq;
+using System.Text;                     // Normalization
+using System.Text.RegularExpressions;  // Regex
+using System.Drawing;                  // Point, Size
+using System.Windows.Forms;
+
+namespace BaiTap3h
+{
+    public partial class Form1 : Form
+    {
+        private readonly BindingList<Student> students = new BindingList<Student>(); // dữ liệu gốc
+        private readonly BindingSource view = new BindingSource();                    // dữ liệu hiển thị (có lọc)
+        private readonly Dictionary<string, bool> sortAsc = new Dictionary<string, bool>(); // trạng thái sort
+
+        // UI bổ sung (theo Câu 2)
+        private ComboBox cmbLocKhoa;   // lọc theo khoa (Tất cả/QTKD/CNTT/NNA)
+        private Button btnDoiMau;      // đổi màu giao diện
+        private Button btnDoiFont;     // đổi font giao diện
+
+        public Form1()
+        {
+            InitializeComponent();
+
+            // ===== DataGridView =====
+            dgvStudent.AutoGenerateColumns = false;
+            dgvStudent.AllowUserToAddRows = false;
+            dgvStudent.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            dgvStudent.MultiSelect = false;
+            dgvStudent.ReadOnly = true;
+
+            dgvStudent.ColumnHeaderMouseClick += dgvStudent_ColumnHeaderMouseClick;
+            dgvStudent.CellClick += dgvStudent_CellClick;
+            dgvStudent.CellContentClick += dgvStudent_CellClick; // yêu cầu dùng CellContentClick
+
+            // Nguồn dữ liệu
+            view.DataSource = students;
+            dgvStudent.DataSource = view;
+
+            // Tạo & map cột
+            EnsureColumns();
+            EnableColumnSortUI();
+
+            // ===== Thêm UI Câu 2 bằng code-behind =====
+            BuildFilterAndStyleUI();
+
+            // Xác nhận thoát
+            this.FormClosing += Form1_FormClosing;
+        }
+
+        // ====== HANDLER THEO DESIGNER ======
+        private void Form1_Load(object sender, EventArgs e)
+        {
+            // Items mẫu nếu rỗng
+            if (cmbKhoa.Items.Count == 0)
+                cmbKhoa.Items.AddRange(new object[] { "QTKD", "CNTT", "NNA" });
+
+            if (cmbXepLoai.Items.Count == 0)
+                cmbXepLoai.Items.AddRange(new object[] { "Tất cả", "Giỏi", "Khá", "Trung Bình", "Yếu" });
+
+            // --- YÊU CẦU ĐỀ BÀI ---
+            // Khoa QTKD mặc định
+            if (cmbKhoa.Items.Contains("QTKD"))
+                cmbKhoa.SelectedItem = "QTKD";
+            else
+                cmbKhoa.SelectedIndex = 0; // fallback
+
+            // Giới tính Nữ mặc định
+            otpFamale.Checked = true;
+
+            // Tổng số SV ban đầu = 0 và vô hiệu hóa 2 ô đếm
+            txtNam.Text = "0";
+            txtNu.Text = "0";
+            txtNam.Enabled = false;
+            txtNu.Enabled = false;
+            txtNam.TabStop = false;
+            txtNu.TabStop = false;
+
+            // Nhấn Enter để kích hoạt nút Tìm
+            this.AcceptButton = btnTimKiem;
+
+            UpdateStats(); // students hiện đang rỗng => 0/0
+        }
+
+        // ================== CRUD ==================
+        private void btnUpdate_Click(object sender, EventArgs e)
+        {
+            // ===== Validation (Câu 4) =====
+            if (string.IsNullOrWhiteSpace(txtMSSV.Text) ||
+                string.IsNullOrWhiteSpace(txtHoTen.Text) ||
+                string.IsNullOrWhiteSpace(txtDTB.Text))
+            {
+                MessageBox.Show("Vui lòng nhập đầy đủ thông tin!");
+                return;
+            }
+
+            var mssv = txtMSSV.Text.Trim();
+            var hoten = txtHoTen.Text.Trim();
+
+            // MSSV: 10 chữ số
+            if (!Regex.IsMatch(mssv, @"^\d{10}$"))
+            {
+                MessageBox.Show("Mã số sinh viên không hợp lệ.");
+                return;
+            }
+
+            // Họ tên: chỉ chữ và khoảng trắng, 3-100 ký tự
+            if (!Regex.IsMatch(hoten, @"^[\p{L}\s]{3,100}$"))
+            {
+                MessageBox.Show("Tên sinh viên không hợp lệ.");
+                return;
+            }
+
+            // Điểm TB: số 0..10
+            if (!double.TryParse(txtDTB.Text, out double dtb) || dtb < 0 || dtb > 10)
+            {
+                MessageBox.Show("Điểm trung bình sinh viên không hợp lệ");
+                return;
+            }
+
+            string gt = otpMale.Checked ? "Nam" : "Nữ";
+            string khoa = cmbKhoa.SelectedItem?.ToString() ?? "";
+
+            // Thêm/Sửa (Câu 5)
+            var sv = students.FirstOrDefault(s =>
+                s.MSSV.Equals(mssv, StringComparison.OrdinalIgnoreCase));
+
+            if (sv == null)
+            {
+                students.Add(new Student
+                {
+                    MSSV = mssv,
+                    HoTen = hoten,
+                    GioiTinh = gt,
+                    DiemTB = dtb,
+                    Khoa = khoa
+                });
+                MessageBox.Show("Thêm mới dữ liệu thành công!");
+            }
+            else
+            {
+                sv.HoTen = hoten;
+                sv.GioiTinh = gt;
+                sv.DiemTB = dtb;
+                sv.Khoa = khoa;
+                MessageBox.Show("Cập nhật dữ liệu thành công!");
+            }
+
+            ResetViewToAll();
+            ClearForm();    // về mặc định QTKD + Nữ
+            UpdateStats();  // cập nhật số nam/nữ
+        }
+
+        private void btnXoa_Click(object sender, EventArgs e)
+        {
+            // Câu 6: Xoá theo MSSV trong ô nhập
+            var mssv = txtMSSV.Text.Trim();
+            if (string.IsNullOrEmpty(mssv))
+            {
+                MessageBox.Show("Vui lòng nhập MSSV cần xoá.");
+                return;
+            }
+
+            var sv = students.FirstOrDefault(x => x.MSSV.Equals(mssv, StringComparison.OrdinalIgnoreCase));
+            if (sv == null)
+            {
+                MessageBox.Show("Mã sinh viên không tồn tại trong hệ thống");
+                return;
+            }
+
+            var ask = MessageBox.Show("Bạn có chắc muốn xóa sinh viên này?", "Xác nhận",
+                                      MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (ask == DialogResult.Yes)
+            {
+                students.Remove(sv);
+                ResetViewToAll();
+                UpdateStats();
+                MessageBox.Show("Xóa sinh viên thành công!");
+            }
+        }
+
+        // đồng bộ ô nhập khi chọn dòng (Câu 7)
+        private void dgvStudent_CellClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= dgvStudent.Rows.Count) return;
+            var sv = dgvStudent.Rows[e.RowIndex].DataBoundItem as Student;
+            if (sv == null) return;
+
+            txtMSSV.Text = sv.MSSV;
+            txtHoTen.Text = sv.HoTen;
+            (sv.GioiTinh == "Nam" ? otpMale : otpFamale).Checked = true;
+            txtDTB.Text = sv.DiemTB.ToString();
+            cmbKhoa.SelectedItem = sv.Khoa;
+        }
+
+        // ================== TÌM & LỌC ==================
+        private void btnTimKiem_Click(object sender, EventArgs e)
+        {
+            FilterAndShow(); // dùng 1 hàm chung
+        }
+
+        private void cmbXepLoai_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            FilterAndShow(); // lọc kết hợp từ khoá + xếp loại + khoa
+        }
+
+        private void FilterAndShow()
+        {
+            string kw = Unaccent(txtTimKiem.Text.Trim()).ToLower();
+
+            IEnumerable<Student> q = students;
+
+            if (!string.IsNullOrEmpty(kw))
+            {
+                q = q.Where(s =>
+                    Unaccent(s.MSSV ?? "").ToLower().Contains(kw) ||
+                    Unaccent(s.HoTen ?? "").ToLower().Contains(kw) ||
+                    Unaccent(s.Khoa ?? "").ToLower().Contains(kw));
+            }
+
+            // Lọc theo khoa trên giao diện (Câu 2)
+            var chonKhoa = cmbLocKhoa?.SelectedItem?.ToString();
+            if (!string.IsNullOrEmpty(chonKhoa) && chonKhoa != "Tất cả")
+            {
+                q = q.Where(s => s.Khoa == chonKhoa);
+            }
+
+            // Lọc theo xếp loại
+            switch (cmbXepLoai.SelectedItem?.ToString())
+            {
+                case "Giỏi": q = q.Where(s => s.DiemTB >= 8); break;
+                case "Khá": q = q.Where(s => s.DiemTB >= 6.5 && s.DiemTB < 8); break;
+                case "Trung Bình": q = q.Where(s => s.DiemTB >= 5 && s.DiemTB < 6.5); break;
+                case "Yếu": q = q.Where(s => s.DiemTB < 5); break;
+                    // "Tất cả": không lọc thêm
+            }
+
+            ApplyFilteredList(q.ToList());   // chỉ hiện kết quả → phần còn lại ẩn
+        }
+
+        // Bỏ dấu để tìm không phân biệt dấu
+        private static string Unaccent(string input)
+        {
+            if (string.IsNullOrEmpty(input)) return string.Empty;
+            string formD = input.Normalize(NormalizationForm.FormD);
+            var chars = formD.Where(c => CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark).ToArray();
+            return new string(chars).Normalize(NormalizationForm.FormC);
+        }
+
+        // ================== SẮP XẾP ==================
+        private void dgvStudent_ColumnHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (dgvStudent.Columns.Count == 0) return;
+
+            var col = dgvStudent.Columns[e.ColumnIndex];
+            string prop = string.IsNullOrEmpty(col.DataPropertyName) ? col.Name : col.DataPropertyName;
+
+            bool asc = sortAsc.ContainsKey(prop) ? !sortAsc[prop] : true;
+            sortAsc[prop] = asc;
+
+            var current = (view.DataSource as IEnumerable<Student>)?.ToList() ?? students.ToList();
+
+            IEnumerable<Student> sorted = current;
+            switch (prop)
+            {
+                case nameof(Student.MSSV): sorted = asc ? current.OrderBy(s => s.MSSV) : current.OrderByDescending(s => s.MSSV); break;
+                case nameof(Student.HoTen): sorted = asc ? current.OrderBy(s => s.HoTen) : current.OrderByDescending(s => s.HoTen); break;
+                case nameof(Student.GioiTinh): sorted = asc ? current.OrderBy(s => s.GioiTinh) : current.OrderByDescending(s => s.GioiTinh); break;
+                case nameof(Student.DiemTB): sorted = asc ? current.OrderBy(s => s.DiemTB) : current.OrderByDescending(s => s.DiemTB); break;
+                case nameof(Student.Khoa): sorted = asc ? current.OrderBy(s => s.Khoa) : current.OrderByDescending(s => s.Khoa); break;
+                case nameof(Student.XepLoai): sorted = asc ? current.OrderBy(s => s.XepLoai) : current.OrderByDescending(s => s.XepLoai); break;
+            }
+
+            ApplyFilteredList(sorted.ToList());
+        }
+
+        // ================== TIỆN ÍCH ==================
+        private void EnsureColumns()
+        {
+            dgvStudent.Columns.Clear();
+
+            dgvStudent.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "colMSSV",
+                HeaderText = "MSSV",
+                DataPropertyName = nameof(Student.MSSV),
+                SortMode = DataGridViewColumnSortMode.Automatic,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                FillWeight = 16
+            });
+            dgvStudent.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "colHoTen",
+                HeaderText = "Họ Tên",
+                DataPropertyName = nameof(Student.HoTen),
+                SortMode = DataGridViewColumnSortMode.Automatic,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                FillWeight = 24
+            });
+            dgvStudent.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "colGioiTinh",
+                HeaderText = "Giới Tính",
+                DataPropertyName = nameof(Student.GioiTinh),
+                SortMode = DataGridViewColumnSortMode.Automatic,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
+            });
+            dgvStudent.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "colDiemTB",
+                HeaderText = "Điểm TB",
+                DataPropertyName = nameof(Student.DiemTB),
+                SortMode = DataGridViewColumnSortMode.Automatic,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells,
+                DefaultCellStyle = new DataGridViewCellStyle { Format = "0.00" }
+            });
+            dgvStudent.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "colKhoa",
+                HeaderText = "Khoa",
+                DataPropertyName = nameof(Student.Khoa),
+                SortMode = DataGridViewColumnSortMode.Automatic,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                FillWeight = 18
+            });
+
+            // Câu 8: thêm cột Xếp loại
+            dgvStudent.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "colXepLoai",
+                HeaderText = "Xếp loại",
+                DataPropertyName = nameof(Student.XepLoai),
+                SortMode = DataGridViewColumnSortMode.Automatic,
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells
+            });
+        }
+
+        private void EnableColumnSortUI()
+        {
+            foreach (DataGridViewColumn c in dgvStudent.Columns)
+                c.SortMode = DataGridViewColumnSortMode.Automatic;
+        }
+
+        private void ApplyFilteredList(List<Student> list)
+        {
+            view.DataSource = new BindingList<Student>(list);
+            dgvStudent.DataSource = view;
+            EnableColumnSortUI();
+        }
+
+        private void ResetViewToAll()
+        {
+            view.DataSource = students;
+            dgvStudent.DataSource = view;
+            EnableColumnSortUI();
+        }
+
+        private void UpdateStats()
+        {
+            // set text được dù Enabled=false
+            txtNam.Text = students.Count(s => s.GioiTinh == "Nam").ToString();
+            txtNu.Text = students.Count(s => s.GioiTinh == "Nữ").ToString();
+        }
+
+        private void ClearForm()
+        {
+            txtMSSV.Clear();
+            txtHoTen.Clear();
+            txtDTB.Clear();
+            // sau khi thêm/sửa, để mặc định theo đề:
+            if (cmbKhoa.Items.Contains("QTKD")) cmbKhoa.SelectedItem = "QTKD";
+            else cmbKhoa.SelectedIndex = 0;
+            otpFamale.Checked = true;
+        }
+
+        // ===== UI phụ trợ: ComboBox lọc khoa + đổi màu/đổi font (Câu 2) =====
+        private void BuildFilterAndStyleUI()
+        {
+            // ComboBox lọc khoa
+            cmbLocKhoa = new ComboBox
+            {
+                Name = "cmbLocKhoa",
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Location = new Point(364, 68),   // đặt gần vùng tìm kiếm
+                Size = new Size(120, 24)
+            };
+            cmbLocKhoa.Items.AddRange(new object[] { "Tất cả", "QTKD", "CNTT", "NNA" });
+            cmbLocKhoa.SelectedIndex = 0;
+            cmbLocKhoa.SelectedIndexChanged += (s, e) => FilterAndShow();
+            this.Controls.Add(cmbLocKhoa);
+
+            // Nút đổi màu
+            btnDoiMau = new Button
+            {
+                Name = "btnDoiMau",
+                Text = "Đổi màu",
+                Location = new Point(364, 12),
+                Size = new Size(85, 28)
+            };
+            btnDoiMau.Click += (s, e) =>
+            {
+                using (var dlg = new ColorDialog())
+                {
+                    if (dlg.ShowDialog() == DialogResult.OK)
+                    {
+                        this.BackColor = dlg.Color;
+                        dgvStudent.BackgroundColor = dlg.Color;
+                    }
+                }
+            };
+            this.Controls.Add(btnDoiMau);
+
+            // Nút đổi font
+            btnDoiFont = new Button
+            {
+                Name = "btnDoiFont",
+                Text = "Đổi font",
+                Location = new Point(455, 12),
+                Size = new Size(85, 28)
+            };
+            btnDoiFont.Click += (s, e) =>
+            {
+                using (var dlg = new FontDialog())
+                {
+                    dlg.Font = this.Font;
+                    if (dlg.ShowDialog() == DialogResult.OK)
+                    {
+                        this.Font = dlg.Font;       // đổi font toàn form
+                        dgvStudent.Font = dlg.Font; // hoặc riêng DGV
+                    }
+                }
+            };
+            this.Controls.Add(btnDoiFont);
+        }
+
+        // ===== XÁC NHẬN THOÁT (YES/NO) =====
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            var result = MessageBox.Show(
+                "Bạn có chắc muốn thoát chương trình?",
+                "Xác nhận thoát",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button2);
+
+            if (result == DialogResult.No)
+            {
+                e.Cancel = true; // không thoát, chỉ đóng hộp thoại
+            }
+        }
+    }
+
+    public class Student : INotifyPropertyChanged
+    {
+        private double _diemTB;
+
+        public string MSSV { get; set; }
+        public string HoTen { get; set; }
+        public string GioiTinh { get; set; }
+        public double DiemTB
+        {
+            get => _diemTB;
+            set
+            {
+                if (Math.Abs(_diemTB - value) > 1e-9)
+                {
+                    _diemTB = value;
+                    OnPropertyChanged(nameof(DiemTB));
+                    OnPropertyChanged(nameof(XepLoai)); // cập nhật hiển thị xếp loại khi điểm đổi
+                }
+            }
+        }
+        public string Khoa { get; set; }
+
+        // Câu 8: Xếp loại tự động
+        public string XepLoai =>
+            _diemTB >= 8 ? "Giỏi" :
+            _diemTB >= 6.5 ? "Khá" :
+            _diemTB >= 5 ? "Trung Bình" : "Yếu";
+
+        public event PropertyChangedEventHandler PropertyChanged;
+        protected void OnPropertyChanged(string name) =>
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+    }
+}
+
+
+
+thư 2 
+namespace BaiTap3h
+{
+    partial class Form1
+    {
+        private System.ComponentModel.IContainer components = null;
+
+        private void InitializeComponent()
+        {
+            this.components = new System.ComponentModel.Container();
+            this.txtMSSV = new System.Windows.Forms.TextBox();
+            this.txtDTB = new System.Windows.Forms.TextBox();
+            this.txtHoTen = new System.Windows.Forms.TextBox();
+            this.txtNam = new System.Windows.Forms.TextBox();
+            this.txtNu = new System.Windows.Forms.TextBox();
+            this.otpMale = new System.Windows.Forms.RadioButton();
+            this.otpFamale = new System.Windows.Forms.RadioButton();
+            this.cmbKhoa = new System.Windows.Forms.ComboBox();
+            this.btnUpdate = new System.Windows.Forms.Button();
+            this.btnXoa = new System.Windows.Forms.Button();
+            this.dgvStudent = new System.Windows.Forms.DataGridView();
+            this.Column1 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.Column2 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.Column3 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.Column4 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.Column5 = new System.Windows.Forms.DataGridViewTextBoxColumn();
+            this.lblMSSV = new System.Windows.Forms.Label();
+            this.lblTitle = new System.Windows.Forms.Label();
+            this.lblDTB = new System.Windows.Forms.Label();
+            this.lblKhoa = new System.Windows.Forms.Label();
+            this.lblHoTen = new System.Windows.Forms.Label();
+            this.lblGioiTinh = new System.Windows.Forms.Label();
+            this.lblSoNam = new System.Windows.Forms.Label();
+            this.lblSoNu = new System.Windows.Forms.Label();
+            this.label1 = new System.Windows.Forms.Label();
+            this.cmbXepLoai = new System.Windows.Forms.ComboBox();
+            this.btnTimKiem = new System.Windows.Forms.Button();
+            this.txtTimKiem = new System.Windows.Forms.TextBox();
+            this.contextMenuStrip1 = new System.Windows.Forms.ContextMenuStrip(this.components);
+            ((System.ComponentModel.ISupportInitialize)(this.dgvStudent)).BeginInit();
+            this.SuspendLayout();
+            // 
+            // txtMSSV
+            // 
+            this.txtMSSV.Location = new System.Drawing.Point(82, 60);
+            this.txtMSSV.Name = "txtMSSV";
+            this.txtMSSV.Size = new System.Drawing.Size(149, 22);
+            this.txtMSSV.TabIndex = 0;
+            // 
+            // txtDTB
+            // 
+            this.txtDTB.Location = new System.Drawing.Point(91, 260);
+            this.txtDTB.Name = "txtDTB";
+            this.txtDTB.Size = new System.Drawing.Size(149, 22);
+            this.txtDTB.TabIndex = 1;
+            // 
+            // txtHoTen
+            // 
+            this.txtHoTen.Location = new System.Drawing.Point(91, 130);
+            this.txtHoTen.Name = "txtHoTen";
+            this.txtHoTen.Size = new System.Drawing.Size(149, 22);
+            this.txtHoTen.TabIndex = 2;
+            // 
+            // txtNam
+            // 
+            this.txtNam.Location = new System.Drawing.Point(657, 403);
+            this.txtNam.Name = "txtNam";
+            this.txtNam.Size = new System.Drawing.Size(149, 22);
+            this.txtNam.TabIndex = 3;
+            // 
+            // txtNu
+            // 
+            this.txtNu.Location = new System.Drawing.Point(887, 400);
+            this.txtNu.Name = "txtNu";
+            this.txtNu.Size = new System.Drawing.Size(149, 22);
+            this.txtNu.TabIndex = 4;
+            // 
+            // otpMale
+            // 
+            this.otpMale.AutoSize = true;
+            this.otpMale.Location = new System.Drawing.Point(72, 205);
+            this.otpMale.Name = "otpMale";
+            this.otpMale.Size = new System.Drawing.Size(57, 20);
+            this.otpMale.TabIndex = 5;
+            this.otpMale.TabStop = true;
+            this.otpMale.Text = "Nam";
+            this.otpMale.UseVisualStyleBackColor = true;
+            // 
+            // otpFamale
+            // 
+            this.otpFamale.AutoSize = true;
+            this.otpFamale.Location = new System.Drawing.Point(195, 205);
+            this.otpFamale.Name = "otpFamale";
+            this.otpFamale.Size = new System.Drawing.Size(45, 20);
+            this.otpFamale.TabIndex = 6;
+            this.otpFamale.TabStop = true;
+            this.otpFamale.Text = "Nu";
+            this.otpFamale.UseVisualStyleBackColor = true;
+            // 
+            // cmbKhoa
+            // 
+            this.cmbKhoa.FormattingEnabled = true;
+            this.cmbKhoa.Items.AddRange(new object[] {
+            "QTKD",
+            "CNTT",
+            "NNA"});
+            this.cmbKhoa.Location = new System.Drawing.Point(110, 314);
+            this.cmbKhoa.Name = "cmbKhoa";
+            this.cmbKhoa.Size = new System.Drawing.Size(121, 24);
+            this.cmbKhoa.TabIndex = 7;
+            // 
+            // btnUpdate
+            // 
+            this.btnUpdate.Location = new System.Drawing.Point(110, 386);
+            this.btnUpdate.Name = "btnUpdate";
+            this.btnUpdate.Size = new System.Drawing.Size(89, 23);
+            this.btnUpdate.TabIndex = 8;
+            this.btnUpdate.Text = "Thêm / Sửa";
+            this.btnUpdate.UseVisualStyleBackColor = true;
+            this.btnUpdate.Click += new System.EventHandler(this.btnUpdate_Click);
+            // 
+            // btnXoa
+            // 
+            this.btnXoa.Location = new System.Drawing.Point(213, 386);
+            this.btnXoa.Name = "btnXoa";
+            this.btnXoa.Size = new System.Drawing.Size(89, 23);
+            this.btnXoa.TabIndex = 9;
+            this.btnXoa.Text = "Xóa";
+            this.btnXoa.UseVisualStyleBackColor = true;
+            this.btnXoa.Click += new System.EventHandler(this.btnXoa_Click);
+            // 
+            // dgvStudent
+            // 
+            this.dgvStudent.AllowUserToAddRows = false;
+            this.dgvStudent.ColumnHeadersHeightSizeMode = System.Windows.Forms.DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+            this.dgvStudent.Columns.AddRange(new System.Windows.Forms.DataGridViewColumn[] {
+            this.Column1,
+            this.Column2,
+            this.Column3,
+            this.Column4,
+            this.Column5});
+            this.dgvStudent.Location = new System.Drawing.Point(364, 105);
+            this.dgvStudent.Name = "dgvStudent";
+            this.dgvStudent.RowHeadersWidth = 51;
+            this.dgvStudent.RowTemplate.Height = 24;
+            this.dgvStudent.SelectionMode = System.Windows.Forms.DataGridViewSelectionMode.FullRowSelect;
+            this.dgvStudent.Size = new System.Drawing.Size(624, 276);
+            this.dgvStudent.TabIndex = 10;
+            this.dgvStudent.CellClick += new System.Windows.Forms.DataGridViewCellEventHandler(this.dgvStudent_CellClick);
+            // 
+            // Column1
+            // 
+            this.Column1.DataPropertyName = "MSSV";
+            this.Column1.HeaderText = "MSSV";
+            this.Column1.MinimumWidth = 6;
+            this.Column1.Name = "Column1";
+            this.Column1.Width = 125;
+            // 
+            // Column2
+            // 
+            this.Column2.DataPropertyName = "HoTen";
+            this.Column2.HeaderText = "Họ Tên";
+            this.Column2.MinimumWidth = 6;
+            this.Column2.Name = "Column2";
+            this.Column2.Width = 125;
+            // 
+            // Column3
+            // 
+            this.Column3.DataPropertyName = "GioiTinh";
+            this.Column3.HeaderText = "Giới Tính";
+            this.Column3.MinimumWidth = 6;
+            this.Column3.Name = "Column3";
+            this.Column3.Width = 125;
+            // 
+            // Column4
+            // 
+            this.Column4.DataPropertyName = "DiemTB";
+            this.Column4.HeaderText = "Điểm TB";
+            this.Column4.MinimumWidth = 6;
+            this.Column4.Name = "Column4";
+            this.Column4.Width = 125;
+            // 
+            // Column5
+            // 
+            this.Column5.DataPropertyName = "Khoa";
+            this.Column5.HeaderText = "Khoa";
+            this.Column5.MinimumWidth = 6;
+            this.Column5.Name = "Column5";
+            this.Column5.Width = 125;
+            // 
+            // lblMSSV
+            // 
+            this.lblMSSV.AutoSize = true;
+            this.lblMSSV.Location = new System.Drawing.Point(82, 40);
+            this.lblMSSV.Name = "lblMSSV";
+            this.lblMSSV.Size = new System.Drawing.Size(48, 16);
+            this.lblMSSV.TabIndex = 11;
+            this.lblMSSV.Text = "MSSV:";
+            // 
+            // lblTitle
+            // 
+            this.lblTitle.AutoSize = true;
+            this.lblTitle.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(0)))), ((int)(((byte)(192)))), ((int)(((byte)(0)))));
+            this.lblTitle.Font = new System.Drawing.Font("Arial", 19.8F, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Point, ((byte)(0)));
+            this.lblTitle.ForeColor = System.Drawing.Color.Blue;
+            this.lblTitle.Location = new System.Drawing.Point(451, 9);
+            this.lblTitle.Name = "lblTitle";
+            this.lblTitle.Size = new System.Drawing.Size(292, 40);
+            this.lblTitle.TabIndex = 12;
+            this.lblTitle.Text = "Quản lý sinh viên";
+            // 
+            // lblDTB
+            // 
+            this.lblDTB.AutoSize = true;
+            this.lblDTB.Location = new System.Drawing.Point(91, 240);
+            this.lblDTB.Name = "lblDTB";
+            this.lblDTB.Size = new System.Drawing.Size(108, 16);
+            this.lblDTB.TabIndex = 13;
+            this.lblDTB.Text = "Điểm Trung Bình:";
+            // 
+            // lblKhoa
+            // 
+            this.lblKhoa.AutoSize = true;
+            this.lblKhoa.Location = new System.Drawing.Point(91, 298);
+            this.lblKhoa.Name = "lblKhoa";
+            this.lblKhoa.Size = new System.Drawing.Size(41, 16);
+            this.lblKhoa.TabIndex = 14;
+            this.lblKhoa.Text = "Khoa:";
+            // 
+            // lblHoTen
+            // 
+            this.lblHoTen.AutoSize = true;
+            this.lblHoTen.Location = new System.Drawing.Point(91, 111);
+            this.lblHoTen.Name = "lblHoTen";
+            this.lblHoTen.Size = new System.Drawing.Size(55, 16);
+            this.lblHoTen.TabIndex = 15;
+            this.lblHoTen.Text = "Họ Tên:";
+            // 
+            // lblGioiTinh
+            // 
+            this.lblGioiTinh.AutoSize = true;
+            this.lblGioiTinh.Location = new System.Drawing.Point(79, 186);
+            this.lblGioiTinh.Name = "lblGioiTinh";
+            this.lblGioiTinh.Size = new System.Drawing.Size(63, 16);
+            this.lblGioiTinh.TabIndex = 16;
+            this.lblGioiTinh.Text = "Giới Tính:";
+            // 
+            // lblSoNam
+            // 
+            this.lblSoNam.AutoSize = true;
+            this.lblSoNam.Location = new System.Drawing.Point(654, 384);
+            this.lblSoNam.Name = "lblSoNam";
+            this.lblSoNam.Size = new System.Drawing.Size(59, 16);
+            this.lblSoNam.TabIndex = 17;
+            this.lblSoNam.Text = "Số Nam:";
+            // 
+            // lblSoNu
+            // 
+            this.lblSoNu.AutoSize = true;
+            this.lblSoNu.Location = new System.Drawing.Point(884, 384);
+            this.lblSoNu.Name = "lblSoNu";
+            this.lblSoNu.Size = new System.Drawing.Size(47, 16);
+            this.lblSoNu.TabIndex = 18;
+            this.lblSoNu.Text = "Số Nữ:";
+            // 
+            // label1
+            // 
+            this.label1.AutoSize = true;
+            this.label1.Location = new System.Drawing.Point(281, 68);
+            this.label1.Name = "label1";
+            this.label1.Size = new System.Drawing.Size(67, 16);
+            this.label1.TabIndex = 19;
+            this.label1.Text = "Xep Hang";
+            // 
+            // cmbXepLoai
+            // 
+            this.cmbXepLoai.FormattingEnabled = true;
+            this.cmbXepLoai.Items.AddRange(new object[] {
+            "Tất cả",
+            "Giỏi",
+            "Khá",
+            "Trung Bình",
+            "Yếu",
+            ""});
+            this.cmbXepLoai.Location = new System.Drawing.Point(354, 69);
+            this.cmbXepLoai.Name = "cmbXepLoai";
+            this.cmbXepLoai.Size = new System.Drawing.Size(136, 24);
+            this.cmbXepLoai.TabIndex = 20;
+            this.cmbXepLoai.SelectedIndexChanged += new System.EventHandler(this.cmbXepLoai_SelectedIndexChanged);
+            // 
+            // btnTimKiem
+            // 
+            this.btnTimKiem.Location = new System.Drawing.Point(908, 69);
+            this.btnTimKiem.Name = "btnTimKiem";
+            this.btnTimKiem.Size = new System.Drawing.Size(80, 21);
+            this.btnTimKiem.TabIndex = 21;
+            this.btnTimKiem.Text = "Tim Kiem";
+            this.btnTimKiem.UseVisualStyleBackColor = true;
+            this.btnTimKiem.Click += new System.EventHandler(this.btnTimKiem_Click);
+            // 
+            // txtTimKiem
+            // 
+            this.txtTimKiem.Location = new System.Drawing.Point(737, 68);
+            this.txtTimKiem.Name = "txtTimKiem";
+            this.txtTimKiem.Size = new System.Drawing.Size(150, 22);
+            this.txtTimKiem.TabIndex = 22;
+            // 
+            // contextMenuStrip1
+            // 
+            this.contextMenuStrip1.ImageScalingSize = new System.Drawing.Size(20, 20);
+            this.contextMenuStrip1.Name = "contextMenuStrip1";
+            this.contextMenuStrip1.Size = new System.Drawing.Size(61, 4);
+            // 
+            // Form1
+            // 
+            this.AcceptButton = this.btnTimKiem;
+            this.BackColor = System.Drawing.Color.FromArgb(((int)(((byte)(255)))), ((int)(((byte)(192)))), ((int)(((byte)(192)))));
+            this.ClientSize = new System.Drawing.Size(1000, 450);
+            this.Controls.Add(this.txtTimKiem);
+            this.Controls.Add(this.btnTimKiem);
+            this.Controls.Add(this.cmbXepLoai);
+            this.Controls.Add(this.label1);
+            this.Controls.Add(this.lblSoNu);
+            this.Controls.Add(this.lblSoNam);
+            this.Controls.Add(this.lblGioiTinh);
+            this.Controls.Add(this.lblHoTen);
+            this.Controls.Add(this.lblKhoa);
+            this.Controls.Add(this.lblDTB);
+            this.Controls.Add(this.lblTitle);
+            this.Controls.Add(this.lblMSSV);
+            this.Controls.Add(this.dgvStudent);
+            this.Controls.Add(this.btnXoa);
+            this.Controls.Add(this.btnUpdate);
+            this.Controls.Add(this.cmbKhoa);
+            this.Controls.Add(this.otpFamale);
+            this.Controls.Add(this.otpMale);
+            this.Controls.Add(this.txtNu);
+            this.Controls.Add(this.txtNam);
+            this.Controls.Add(this.txtHoTen);
+            this.Controls.Add(this.txtDTB);
+            this.Controls.Add(this.txtMSSV);
+            this.Name = "Form1";
+            this.Text = "Quản lý Sinh viên";
+            this.Load += new System.EventHandler(this.Form1_Load);
+            ((System.ComponentModel.ISupportInitialize)(this.dgvStudent)).EndInit();
+            this.ResumeLayout(false);
+            this.PerformLayout();
+
+        }
+
+        // ====== FIELDS ======
+        private System.Windows.Forms.TextBox txtMSSV;
+        private System.Windows.Forms.TextBox txtDTB;
+        private System.Windows.Forms.TextBox txtHoTen;
+        private System.Windows.Forms.TextBox txtNam;
+        private System.Windows.Forms.TextBox txtNu;
+        private System.Windows.Forms.RadioButton otpMale;
+        private System.Windows.Forms.RadioButton otpFamale;
+        private System.Windows.Forms.ComboBox cmbKhoa;
+        private System.Windows.Forms.Button btnUpdate;
+        private System.Windows.Forms.Button btnXoa;
+        private System.Windows.Forms.DataGridView dgvStudent;
+        private System.Windows.Forms.DataGridViewTextBoxColumn Column1;
+        private System.Windows.Forms.DataGridViewTextBoxColumn Column2;
+        private System.Windows.Forms.DataGridViewTextBoxColumn Column3;
+        private System.Windows.Forms.DataGridViewTextBoxColumn Column4;
+        private System.Windows.Forms.DataGridViewTextBoxColumn Column5;
+        private System.Windows.Forms.Label lblMSSV;
+        private System.Windows.Forms.Label lblTitle;
+        private System.Windows.Forms.Label lblDTB;
+        private System.Windows.Forms.Label lblKhoa;
+        private System.Windows.Forms.Label lblHoTen;
+        private System.Windows.Forms.Label lblGioiTinh;
+        private System.Windows.Forms.Label lblSoNam;
+        private System.Windows.Forms.Label lblSoNu;
+        private System.Windows.Forms.Label label1;
+        private System.Windows.Forms.ComboBox cmbXepLoai;
+        private System.Windows.Forms.Button btnTimKiem;       // PHẢI là Button
+        private System.Windows.Forms.TextBox txtTimKiem;     // Ô nhập tìm kiếm
+        private System.Windows.Forms.ContextMenuStrip contextMenuStrip1;
+    }
+}
